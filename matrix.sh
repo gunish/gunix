@@ -2,6 +2,9 @@
 
 # Matrix-style falling character rain for your terminal
 
+# Ensure UTF-8 locale for multibyte character handling
+export LC_ALL="${LC_ALL:-en_US.UTF-8}"
+
 VERSION="1.0.0"
 CODE_MODE=0
 REPO_PATH="."
@@ -78,15 +81,15 @@ build_code_pool() {
             2>/dev/null)
     fi
 
-    # Read all file contents, extract unique printable chars
-    local content=""
-    while IFS= read -r file; do
-        local full_path="$repo/$file"
-        [[ -f "$full_path" ]] && content+=$(head -c 50000 "$full_path" 2>/dev/null)
-    done <<< "$files"
-
-    # Filter to printable non-whitespace characters, deduplicate
-    CHAR_POOL=$(printf '%s' "$content" | tr -dc '[:print:]' | tr -d '[:space:]' | fold -w1 | sort -u | tr -d '\n')
+    # Read file contents (capped at ~500KB total), extract unique printable chars
+    local max_size=500000
+    CHAR_POOL=$(
+        printf '%s\n' "$files" | head -200 | while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            local full_path="$repo/$file"
+            [[ -f "$full_path" ]] && head -c 5000 "$full_path" 2>/dev/null
+        done | head -c "$max_size" | LC_ALL=C tr -dc '!-~' | grep -o . | sort -u | tr -d '\n'
+    )
 
     # Fallback if pool is empty
     if [[ -z "$CHAR_POOL" ]]; then
@@ -95,18 +98,31 @@ build_code_pool() {
     fi
 }
 
+# Split pool into array for safe multibyte indexing
+declare -a CHAR_ARRAY=()
+POOL_SIZE=0
+
+build_char_array() {
+    CHAR_ARRAY=()
+    local i
+    for (( i=0; i<${#CHAR_POOL}; i++ )); do
+        CHAR_ARRAY+=("${CHAR_POOL:$i:1}")
+    done
+    POOL_SIZE=${#CHAR_ARRAY[@]}
+}
+
+# Get a random character from the pool (sets RCHAR variable, no subshell)
+random_char() {
+    RCHAR="${CHAR_ARRAY[RANDOM % POOL_SIZE]}"
+}
+
 if [[ "$CODE_MODE" -eq 1 ]]; then
     build_code_pool "$REPO_PATH"
 else
     build_random_pool
 fi
 
-# Get a random character from the pool
-random_char() {
-    local len=${#CHAR_POOL}
-    local idx=$((RANDOM % len))
-    printf '%s' "${CHAR_POOL:$idx:1}"
-}
+build_char_array
 
 # --- Terminal Setup ---
 COLS=0
@@ -118,7 +134,11 @@ get_dimensions() {
     LINES_COUNT=$(tput lines)
 }
 
+KEY_READER_PID=""
+
 cleanup() {
+    # Kill background key reader if running
+    [[ -n "$KEY_READER_PID" ]] && kill "$KEY_READER_PID" 2>/dev/null
     # Restore terminal
     tput cnorm          # Show cursor
     tput sgr0           # Reset colors
@@ -131,8 +151,8 @@ cleanup() {
 }
 
 init_terminal() {
-    ORIG_STTY=$(stty -g)
-    stty -echo -icanon min 0 time 0
+    ORIG_STTY=$(stty -g 2>/dev/null)
+    stty -echo          # Disable echo (we handle display ourselves)
     tput civis          # Hide cursor
     printf '\033[2J'    # Clear screen
     printf '\033[H'     # Move to top-left
@@ -157,7 +177,7 @@ init_stream() {
     STREAM_POS[$col]=$(( (RANDOM % LINES_COUNT) * -1 ))  # Start above screen
     STREAM_LEN[$col]=$(( RANDOM % 5 + 4 ))               # Length 4-8
     STREAM_SPEED[$col]=0
-    STREAM_THRESHOLD[$col]=$(( RANDOM % 3 + 1 ))          # Speed 1-3
+    STREAM_THRESHOLD[$col]=$(( RANDOM % 3 + 2 ))          # Speed 2-4
     STREAM_ACTIVE[$col]=1
     STREAM_PAUSE[$col]=0
 }
@@ -181,12 +201,15 @@ init_streams() {
 
 # --- Rendering ---
 
+# Frame buffer — accumulate all output, flush once per frame
+FRAME_BUF=""
+
 # Move cursor and print a colored character at (row, col)
 put_char() {
     local row=$1 col=$2 char=$3 color=$4
     # Only draw within bounds
     if (( row >= 0 && row < LINES_COUNT && col >= 0 && col < COLS )); then
-        printf '\033[%d;%dH%b%s' $((row + 1)) $((col + 1)) "$color" "$char"
+        FRAME_BUF+="\033[$((row + 1));$((col + 1))H${color}${char}"
     fi
 }
 
@@ -194,7 +217,7 @@ put_char() {
 clear_cell() {
     local row=$1 col=$2
     if (( row >= 0 && row < LINES_COUNT )); then
-        printf '\033[%d;%dH ' $((row + 1)) $((col + 1))
+        FRAME_BUF+="\033[$((row + 1));$((col + 1))H "
     fi
 }
 
@@ -203,7 +226,6 @@ COLOR_HEAD='\033[1;97m'        # Bright white (head)
 COLOR_NEAR='\033[1;32m'        # Bright green
 COLOR_MID='\033[0;32m'         # Normal green
 COLOR_DIM='\033[2;32m'         # Dim green
-COLOR_RESET='\033[0m'
 
 render_frame() {
     for (( col=0; col<COLS; col++ )); do
@@ -227,17 +249,17 @@ render_frame() {
         local len=${STREAM_LEN[$col]}
 
         # Draw head (bright white)
-        put_char "$pos" "$col" "$(random_char)" "$COLOR_HEAD"
+        random_char; put_char "$pos" "$col" "$RCHAR" "$COLOR_HEAD"
 
         # Recolor previous head position to bright green
-        put_char $((pos - 1)) "$col" "$(random_char)" "$COLOR_NEAR"
+        random_char; put_char $((pos - 1)) "$col" "$RCHAR" "$COLOR_NEAR"
 
         # Mid trail
-        put_char $((pos - 2)) "$col" "$(random_char)" "$COLOR_MID"
+        random_char; put_char $((pos - 2)) "$col" "$RCHAR" "$COLOR_MID"
 
         # Dim trail
         for (( t=3; t<=len; t++ )); do
-            put_char $((pos - t)) "$col" "$(random_char)" "$COLOR_DIM"
+            random_char; put_char $((pos - t)) "$col" "$RCHAR" "$COLOR_DIM"
         done
 
         # Clear tail (character falling off the trail)
@@ -253,7 +275,9 @@ render_frame() {
         fi
     done
 
-    printf "$COLOR_RESET"
+    FRAME_BUF+="\033[0m"
+    printf '%b' "$FRAME_BUF"
+    FRAME_BUF=""
 }
 
 # --- Main Loop ---
@@ -268,11 +292,18 @@ main() {
 
     init_streams
 
+    # Background process: wait for any keypress, then signal main process
+    GOT_KEY=0
+    trap 'GOT_KEY=1' USR1
+    ( read -rsn1 _ < /dev/tty 2>/dev/null; kill -USR1 $$ 2>/dev/null ) &
+    KEY_READER_PID=$!
+
     while true; do
         render_frame
+        sleep 0.05
 
-        # Non-blocking keypress check
-        if read -rsn1 -t 0.05 _key 2>/dev/null; then
+        # Check if background reader caught a keypress
+        if (( GOT_KEY )); then
             break
         fi
     done
